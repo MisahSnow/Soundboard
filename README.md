@@ -10,6 +10,12 @@ WinForms `.NET 8` soundboard recreation with:
 - Right-click tile color change/reset
 - Saved folder, outputs, volumes, and tile colors
 
+## Dependencies / Prerequisites
+
+- Windows x64
+- .NET 8 SDK (for building)
+- NuGet access during restore (for `NAudio`)
+
 ## Run
 
 ```powershell
