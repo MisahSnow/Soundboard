@@ -214,9 +214,25 @@ public sealed class MainForm : Form
             return;
         }
 
-        foreach (var file in Directory.EnumerateFiles(folder)
-                     .Where(f => AudioExts.Contains(Path.GetExtension(f)))
-                     .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
+        var discovered = Directory.EnumerateFiles(folder)
+            .Where(f => AudioExts.Contains(Path.GetExtension(f)))
+            .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var byName = discovered.ToDictionary(Path.GetFileName, StringComparer.OrdinalIgnoreCase);
+        var orderedFiles = new List<string>();
+        foreach (var name in _settings.TileOrder)
+        {
+            if (byName.TryGetValue(name, out var path))
+                orderedFiles.Add(path);
+        }
+        foreach (var path in discovered)
+        {
+            if (!orderedFiles.Contains(path, StringComparer.OrdinalIgnoreCase))
+                orderedFiles.Add(path);
+        }
+
+        foreach (var file in orderedFiles)
         {
             var fileName = Path.GetFileName(file);
             var volume = _settings.SoundVolumes.TryGetValue(fileName, out var v) ? Math.Clamp(v, 0, 100) : 100;
@@ -242,6 +258,15 @@ public sealed class MainForm : Form
                 _clearHotkeyMenuItem.Visible = tile.Hotkey != Keys.None;
                 _tileMenu.Show(tile, p);
             };
+            tile.AllowDrop = true;
+            tile.DragEnter += HandleDragEnter;
+            tile.DragDrop += HandleDragDrop;
+            foreach (Control child in tile.Controls)
+            {
+                child.AllowDrop = true;
+                child.DragEnter += HandleDragEnter;
+                child.DragDrop += HandleDragDrop;
+            }
             _tiles.Add(tile);
             _grid.Controls.Add(tile);
         }
@@ -549,11 +574,24 @@ public sealed class MainForm : Form
 
     private void HandleDragEnter(object? sender, DragEventArgs e)
     {
+        if (e.Data?.GetDataPresent(typeof(Tile)) == true)
+        {
+            e.Effect = DragDropEffects.Move;
+            return;
+        }
         e.Effect = e.Data?.GetDataPresent(DataFormats.FileDrop) == true ? DragDropEffects.Copy : DragDropEffects.None;
     }
 
     private void HandleDragDrop(object? sender, DragEventArgs e)
     {
+        if (e.Data?.GetDataPresent(typeof(Tile)) == true)
+        {
+            var tile = e.Data.GetData(typeof(Tile)) as Tile;
+            if (tile is not null)
+                ReorderTile(tile, _grid.PointToClient(new Point(e.X, e.Y)));
+            return;
+        }
+
         if (string.IsNullOrWhiteSpace(_settings.LastFolder) || !Directory.Exists(_settings.LastFolder))
         {
             SetStatus("Choose a sound folder first, then drag files in.");
@@ -575,6 +613,38 @@ public sealed class MainForm : Form
 
         if (imported > 0) LoadFolderIfValid(_settings.LastFolder);
         SetStatus(imported > 0 ? $"Imported {imported} file(s){(skipped > 0 ? $", skipped {skipped}" : "")}." : "No supported files imported.");
+    }
+
+    private void ReorderTile(Tile dragged, Point dropPoint)
+    {
+        int from = _tiles.IndexOf(dragged);
+        if (from < 0) return;
+
+        var hit = _grid.GetChildAtPoint(dropPoint);
+        var targetTile = hit as Tile;
+        if (targetTile is null || ReferenceEquals(targetTile, dragged))
+            return;
+
+        int target = _tiles.IndexOf(targetTile);
+        if (target < 0 || target == from)
+            return;
+
+        // Swap positions by dropping one tile directly on another tile.
+        (_tiles[from], _tiles[target]) = (_tiles[target], _tiles[from]);
+
+        _grid.SuspendLayout();
+        _grid.Controls.Clear();
+        _grid.Controls.AddRange(_tiles.Cast<Control>().ToArray());
+        _grid.ResumeLayout();
+        ReflowGrid();
+        SaveTileOrderFromCurrent();
+        SetStatus("Tile order updated.");
+    }
+
+    private void SaveTileOrderFromCurrent()
+    {
+        _settings.TileOrder = _tiles.Select(t => Path.GetFileName(t.FilePath)).ToList();
+        SaveSettings();
     }
 
     private static string UniqueImportPath(string folder, string fileName)
@@ -630,6 +700,7 @@ public sealed class MainForm : Form
         public Dictionary<string, int> SoundVolumes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> SoundColors { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, int> SoundHotkeys { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public List<string> TileOrder { get; set; } = [];
     }
 }
 
@@ -692,6 +763,16 @@ internal sealed class Tile : Panel
         _vol.ValueChanged += (_, _) => _volLabel.Text = $"{_vol.Value}%";
         _vol.MouseUp += (_, e) => { if (e.Button == MouseButtons.Left) VolumeCommitted?.Invoke(this, _vol.Value); };
 
+        AllowDrop = true;
+        _play.MouseDown += DragBeginMouseDown;
+        _name.MouseDown += DragBeginMouseDown;
+        _volLabel.MouseDown += DragBeginMouseDown;
+        MouseDown += DragBeginMouseDown;
+        _play.MouseMove += DragBeginMouseMove;
+        _name.MouseMove += DragBeginMouseMove;
+        _volLabel.MouseMove += DragBeginMouseMove;
+        MouseMove += DragBeginMouseMove;
+
         foreach (Control c in Controls) c.MouseUp += ChildMouseUp;
         MouseUp += ChildMouseUp;
     }
@@ -699,8 +780,36 @@ internal sealed class Tile : Panel
     public void SetFilePath(string path) => FilePath = path;
     public void SetDisplayName(string name) => _name.Text = name;
 
+    private Point _dragStart;
+    private bool _dragStartSet;
+
+    private void DragBeginMouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        _dragStart = Cursor.Position;
+        _dragStartSet = true;
+    }
+
+    private void DragBeginMouseMove(object? sender, MouseEventArgs e)
+    {
+        if (!_dragStartSet || (Control.MouseButtons & MouseButtons.Left) == 0) return;
+        var size = SystemInformation.DragSize;
+        var dragRect = new Rectangle(
+            _dragStart.X - size.Width / 2,
+            _dragStart.Y - size.Height / 2,
+            size.Width,
+            size.Height);
+        if (!dragRect.Contains(Cursor.Position))
+        {
+            _dragStartSet = false;
+            DoDragDrop(this, DragDropEffects.Move);
+        }
+    }
+
     private void ChildMouseUp(object? sender, MouseEventArgs e)
     {
+        if (e.Button == MouseButtons.Left)
+            _dragStartSet = false;
         if (e.Button != MouseButtons.Right) return;
         var src = sender as Control ?? this;
         MenuRequested?.Invoke(this, PointToClient(src.PointToScreen(e.Location)));
