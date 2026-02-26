@@ -17,6 +17,19 @@ dotnet restore
 dotnet run
 ```
 
+## Build
+
+```powershell
+dotnet restore
+dotnet build -c Release
+```
+
+## Publish (Windows x64 EXE)
+
+```powershell
+dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o .\Build
+```
+
 ## Note
 
 This project uses `NAudio` for playback and output device selection.
