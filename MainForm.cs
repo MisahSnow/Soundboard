@@ -28,7 +28,8 @@ public sealed class MainForm : Form
     private readonly ComboBox _output2 = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly Button _refreshDevicesBtn = new() { Text = "Refresh Devices" };
     private readonly Button _stopAllBtn = new() { Text = "Stop All" };
-    private readonly FlowLayoutPanel _grid = new() { Dock = DockStyle.Fill, AutoScroll = true, WrapContents = true };
+    private readonly NavyScrollableFlow _gridHost = new() { Dock = DockStyle.Fill };
+    private FlowLayoutPanel _grid => _gridHost.Grid;
     private readonly Label _status = new() { Dock = DockStyle.Bottom, Height = 28, TextAlign = ContentAlignment.MiddleLeft };
     private readonly ContextMenuStrip _tileMenu = new();
     private readonly ToolStripMenuItem _renameMenuItem = new("Rename File");
@@ -105,7 +106,7 @@ public sealed class MainForm : Form
         _output1.Width = _output2.Width = 420;
 
         var soundsBox = new GroupBox { Text = "Sounds", Dock = DockStyle.Fill, Padding = new Padding(8) };
-        soundsBox.Controls.Add(_grid);
+        soundsBox.Controls.Add(_gridHost);
         root.Controls.Add(soundsBox, 0, 2);
 
         _status.Padding = new Padding(8, 0, 0, 0);
@@ -135,6 +136,9 @@ public sealed class MainForm : Form
         _grid.AllowDrop = true;
         _grid.DragEnter += HandleDragEnter;
         _grid.DragDrop += HandleDragDrop;
+        _gridHost.AllowDrop = true;
+        _gridHost.DragEnter += HandleDragEnter;
+        _gridHost.DragDrop += HandleDragDrop;
         KeyDown += MainForm_KeyDown;
     }
 
@@ -171,12 +175,18 @@ public sealed class MainForm : Form
                 case FlowLayoutPanel fp:
                     fp.BackColor = BackColor;
                     break;
+                case NavyScrollableFlow sf:
+                    sf.BackColor = BackColor;
+                    break;
                 case Label l when l != _status:
                     l.ForeColor = Color.White;
                     l.BackColor = Color.Transparent;
                     break;
             }
         }
+        _gridHost.ScrollTrackColor = Color.FromArgb(20, 36, 64);
+        _gridHost.ScrollThumbColor = Color.FromArgb(52, 84, 132);
+        _gridHost.ScrollThumbHoverColor = Color.FromArgb(68, 106, 164);
     }
 
     private static IEnumerable<Control> GetAllControls(Control c)
@@ -704,6 +714,203 @@ public sealed class MainForm : Form
     }
 }
 
+internal sealed class NavyScrollableFlow : UserControl
+{
+    private readonly NavyVScrollBar _vScroll = new() { Width = 14 };
+    public FlowLayoutPanel Grid { get; } = new() { WrapContents = true, AutoScroll = false, Margin = Padding.Empty };
+
+    public Color ScrollTrackColor { get => _vScroll.TrackColor; set => _vScroll.TrackColor = value; }
+    public Color ScrollThumbColor { get => _vScroll.ThumbColor; set => _vScroll.ThumbColor = value; }
+    public Color ScrollThumbHoverColor { get => _vScroll.ThumbHoverColor; set => _vScroll.ThumbHoverColor = value; }
+
+    public NavyScrollableFlow()
+    {
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+        Grid.Location = Point.Empty;
+        Controls.Add(Grid);
+        Controls.Add(_vScroll);
+
+        Resize += (_, _) => LayoutChildren();
+        Grid.Layout += (_, _) => UpdateScrollMetrics();
+        Grid.ControlAdded += (_, e) => AttachWheelHandlers(e.Control);
+        Grid.ControlRemoved += (_, _) => UpdateScrollMetrics();
+        _vScroll.ValueChanged += (_, _) => ApplyScroll();
+
+        MouseWheel += HandleMouseWheel;
+        Grid.MouseWheel += HandleMouseWheel;
+    }
+
+    private void LayoutChildren()
+    {
+        var barVisible = _vScroll.Visible;
+        var barW = barVisible ? _vScroll.Width : 0;
+        Grid.Bounds = new Rectangle(0, -_vScroll.Value, Math.Max(1, ClientSize.Width - barW), Math.Max(1, ClientSize.Height + _vScroll.Value));
+        _vScroll.Location = new Point(ClientSize.Width - _vScroll.Width, 0);
+        _vScroll.Height = ClientSize.Height;
+        UpdateScrollMetrics();
+    }
+
+    private void UpdateScrollMetrics()
+    {
+        int contentBottom = Grid.Padding.Top + Grid.Padding.Bottom;
+        foreach (Control c in Grid.Controls)
+            contentBottom = Math.Max(contentBottom, c.Bottom + Grid.Padding.Bottom);
+
+        int viewport = Math.Max(1, ClientSize.Height);
+        int maximum = Math.Max(0, contentBottom - viewport);
+        _vScroll.SetMetrics(maximum, viewport);
+        _vScroll.Visible = maximum > 0;
+
+        var barW = _vScroll.Visible ? _vScroll.Width : 0;
+        Grid.Width = Math.Max(1, ClientSize.Width - barW);
+        ApplyScroll();
+    }
+
+    private void ApplyScroll()
+    {
+        Grid.Top = -_vScroll.Value;
+    }
+
+    private void AttachWheelHandlers(Control root)
+    {
+        root.MouseWheel += HandleMouseWheel;
+        foreach (Control child in root.Controls)
+            AttachWheelHandlers(child);
+    }
+
+    private void HandleMouseWheel(object? sender, MouseEventArgs e)
+    {
+        if (!_vScroll.Visible) return;
+        int lines = SystemInformation.MouseWheelScrollLines <= 0 ? 3 : SystemInformation.MouseWheelScrollLines;
+        int deltaLines = e.Delta / SystemInformation.MouseWheelScrollDelta;
+        _vScroll.Value -= deltaLines * lines * 18;
+    }
+}
+
+internal sealed class NavyVScrollBar : Control
+{
+    private int _maximum;
+    private int _viewport = 1;
+    private int _value;
+    private bool _hover;
+    private bool _dragging;
+    private int _dragOffsetY;
+
+    public event EventHandler? ValueChanged;
+    public Color TrackColor { get; set; } = Color.FromArgb(20, 36, 64);
+    public Color ThumbColor { get; set; } = Color.FromArgb(52, 84, 132);
+    public Color ThumbHoverColor { get; set; } = Color.FromArgb(68, 106, 164);
+
+    public int Value
+    {
+        get => _value;
+        set
+        {
+            int clamped = Math.Clamp(value, 0, _maximum);
+            if (clamped == _value) return;
+            _value = clamped;
+            Invalidate();
+            ValueChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    public NavyVScrollBar()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        Cursor = Cursors.Hand;
+        Width = 14;
+    }
+
+    public void SetMetrics(int maximum, int viewport)
+    {
+        _maximum = Math.Max(0, maximum);
+        _viewport = Math.Max(1, viewport);
+        Value = _value;
+        Invalidate();
+    }
+
+    protected override void OnMouseEnter(EventArgs e)
+    {
+        _hover = true;
+        Invalidate();
+        base.OnMouseEnter(e);
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        _hover = false;
+        if (!_dragging) Invalidate();
+        base.OnMouseLeave(e);
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        var thumb = ThumbRect();
+        if (thumb.Contains(e.Location))
+        {
+            _dragging = true;
+            _dragOffsetY = e.Y - thumb.Top;
+            Capture = true;
+        }
+        else
+        {
+            int page = Math.Max(24, _viewport - 24);
+            Value += e.Y < thumb.Top ? -page : page;
+        }
+        base.OnMouseDown(e);
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        if (_dragging)
+        {
+            int trackH = Math.Max(1, Height - 4);
+            int thumbH = ThumbRect().Height;
+            int travel = Math.Max(1, trackH - thumbH);
+            int thumbTop = Math.Clamp(e.Y - _dragOffsetY - 2, 0, travel);
+            Value = (int)Math.Round((_maximum * (thumbTop / (double)travel)));
+        }
+        base.OnMouseMove(e);
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left)
+        {
+            _dragging = false;
+            Capture = false;
+        }
+        base.OnMouseUp(e);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        e.Graphics.Clear(Parent?.BackColor ?? Color.FromArgb(18, 22, 28));
+        using var track = new SolidBrush(TrackColor);
+        using var border = new Pen(Color.FromArgb(95, 105, 120));
+        var trackRect = new Rectangle(1, 2, Width - 3, Height - 4);
+        e.Graphics.FillRectangle(track, trackRect);
+        e.Graphics.DrawRectangle(border, trackRect);
+
+        var thumbRect = ThumbRect();
+        using var thumb = new SolidBrush((_hover || _dragging) ? ThumbHoverColor : ThumbColor);
+        e.Graphics.FillRectangle(thumb, thumbRect);
+        e.Graphics.DrawRectangle(Pens.Black, thumbRect);
+    }
+
+    private Rectangle ThumbRect()
+    {
+        int trackH = Math.Max(1, Height - 4);
+        if (_maximum <= 0) return new Rectangle(2, 2, Math.Max(6, Width - 4), trackH);
+
+        int thumbH = Math.Clamp((int)Math.Round(trackH * (_viewport / (double)(_maximum + _viewport))), 28, trackH);
+        int travel = Math.Max(1, trackH - thumbH);
+        int thumbY = 2 + (int)Math.Round((_value / (double)_maximum) * travel);
+        return new Rectangle(2, thumbY, Math.Max(6, Width - 4), thumbH);
+    }
+}
+
 internal sealed class Tile : Panel
 {
     private readonly GoofyButton _play = new();
@@ -782,12 +989,15 @@ internal sealed class Tile : Panel
 
     private Point _dragStart;
     private bool _dragStartSet;
+    private long _dragStartTicks;
+    private const int DragStartDelayMs = 200;
 
     private void DragBeginMouseDown(object? sender, MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left) return;
         _dragStart = Cursor.Position;
         _dragStartSet = true;
+        _dragStartTicks = Environment.TickCount64;
     }
 
     private void DragBeginMouseMove(object? sender, MouseEventArgs e)
@@ -799,7 +1009,8 @@ internal sealed class Tile : Panel
             _dragStart.Y - size.Height / 2,
             size.Width,
             size.Height);
-        if (!dragRect.Contains(Cursor.Position))
+        var heldLongEnough = Environment.TickCount64 - _dragStartTicks >= DragStartDelayMs;
+        if (heldLongEnough && !dragRect.Contains(Cursor.Position))
         {
             _dragStartSet = false;
             DoDragDrop(this, DragDropEffects.Move);
