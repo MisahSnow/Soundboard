@@ -11,5 +11,12 @@
   },
   "SoundHotkeys": {
     "Canada.mp3": 131169
-  }
+  },
+  "TileOrder": [
+    "Emotional Damage.mp3",
+    "Crickets.mp3",
+    "Indian Song.mp3",
+    "Canada.mp3",
+    "Romanceeee.mp3"
+  ]
 }
