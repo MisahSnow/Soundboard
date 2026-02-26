@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Runtime.InteropServices;
 using NAudio.Wave;
 
 namespace SoundboardNet;
@@ -41,6 +42,8 @@ public sealed class MainForm : Form
 
     public MainForm()
     {
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+        DoubleBuffered = true;
         Text = ".NET Soundboard";
         Width = 1150;
         Height = 780;
@@ -69,6 +72,27 @@ public sealed class MainForm : Form
         SaveSettings();
         base.OnFormClosing(e);
     }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        ApplySystemDarkTitleBar();
+    }
+
+    private void ApplySystemDarkTitleBar()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+            int enabled = 1;
+            _ = DwmSetWindowAttribute(Handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref enabled, sizeof(int));
+        }
+        catch { }
+    }
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
 
     private void BuildUi()
     {
@@ -717,7 +741,9 @@ public sealed class MainForm : Form
 internal sealed class NavyScrollableFlow : UserControl
 {
     private readonly NavyVScrollBar _vScroll = new() { Width = 14 };
-    public FlowLayoutPanel Grid { get; } = new() { WrapContents = true, AutoScroll = false, Margin = Padding.Empty };
+    private int _contentHeight = 1;
+    private bool _updatingMetrics;
+    public SmoothFlowLayoutPanel Grid { get; } = new() { WrapContents = true, AutoScroll = false, Margin = Padding.Empty };
 
     public Color ScrollTrackColor { get => _vScroll.TrackColor; set => _vScroll.TrackColor = value; }
     public Color ScrollThumbColor { get => _vScroll.ThumbColor; set => _vScroll.ThumbColor = value; }
@@ -725,7 +751,7 @@ internal sealed class NavyScrollableFlow : UserControl
 
     public NavyScrollableFlow()
     {
-        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+        SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
         Grid.Location = Point.Empty;
         Controls.Add(Grid);
         Controls.Add(_vScroll);
@@ -742,9 +768,6 @@ internal sealed class NavyScrollableFlow : UserControl
 
     private void LayoutChildren()
     {
-        var barVisible = _vScroll.Visible;
-        var barW = barVisible ? _vScroll.Width : 0;
-        Grid.Bounds = new Rectangle(0, -_vScroll.Value, Math.Max(1, ClientSize.Width - barW), Math.Max(1, ClientSize.Height + _vScroll.Value));
         _vScroll.Location = new Point(ClientSize.Width - _vScroll.Width, 0);
         _vScroll.Height = ClientSize.Height;
         UpdateScrollMetrics();
@@ -752,23 +775,56 @@ internal sealed class NavyScrollableFlow : UserControl
 
     private void UpdateScrollMetrics()
     {
-        int contentBottom = Grid.Padding.Top + Grid.Padding.Bottom;
-        foreach (Control c in Grid.Controls)
-            contentBottom = Math.Max(contentBottom, c.Bottom + Grid.Padding.Bottom);
+        if (_updatingMetrics) return;
+        _updatingMetrics = true;
+        try
+        {
+            int viewport = Math.Max(1, ClientSize.Height);
 
-        int viewport = Math.Max(1, ClientSize.Height);
-        int maximum = Math.Max(0, contentBottom - viewport);
-        _vScroll.SetMetrics(maximum, viewport);
-        _vScroll.Visible = maximum > 0;
+            // First pass without scrollbar to determine whether one is needed.
+            int widthNoBar = Math.Max(1, ClientSize.Width);
+            int contentNoBar = ComputeContentHeight(widthNoBar);
+            bool needsBar = contentNoBar > viewport;
 
-        var barW = _vScroll.Visible ? _vScroll.Width : 0;
-        Grid.Width = Math.Max(1, ClientSize.Width - barW);
-        ApplyScroll();
+            int gridWidth = Math.Max(1, ClientSize.Width - (needsBar ? _vScroll.Width : 0));
+            int contentHeight = ComputeContentHeight(gridWidth);
+            if (!needsBar && contentHeight > viewport)
+            {
+                needsBar = true;
+                gridWidth = Math.Max(1, ClientSize.Width - _vScroll.Width);
+                contentHeight = ComputeContentHeight(gridWidth);
+            }
+
+            _vScroll.Visible = needsBar;
+            _contentHeight = Math.Max(viewport, contentHeight);
+
+            if (Grid.Width != gridWidth) Grid.Width = gridWidth;
+            if (Grid.Height != _contentHeight) Grid.Height = _contentHeight;
+
+            int maximum = Math.Max(0, _contentHeight - viewport);
+            _vScroll.SetMetrics(maximum, viewport);
+            ApplyScroll();
+        }
+        finally
+        {
+            _updatingMetrics = false;
+        }
     }
 
     private void ApplyScroll()
     {
         Grid.Top = -_vScroll.Value;
+    }
+
+    private int ComputeContentHeight(int width)
+    {
+        if (width <= 0) return 1;
+        if (Grid.Width != width) Grid.Width = width;
+        var preferred = Grid.GetPreferredSize(new Size(width, 0));
+        int contentBottom = Grid.Padding.Top + Grid.Padding.Bottom + preferred.Height;
+        foreach (Control c in Grid.Controls)
+            contentBottom = Math.Max(contentBottom, c.Bottom + c.Margin.Bottom + Grid.Padding.Bottom);
+        return Math.Max(1, contentBottom);
     }
 
     private void AttachWheelHandlers(Control root)
@@ -784,6 +840,22 @@ internal sealed class NavyScrollableFlow : UserControl
         int lines = SystemInformation.MouseWheelScrollLines <= 0 ? 3 : SystemInformation.MouseWheelScrollLines;
         int deltaLines = e.Delta / SystemInformation.MouseWheelScrollDelta;
         _vScroll.Value -= deltaLines * lines * 18;
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        using var b = new SolidBrush(BackColor);
+        e.Graphics.FillRectangle(b, ClientRectangle);
+    }
+}
+
+internal sealed class SmoothFlowLayoutPanel : FlowLayoutPanel
+{
+    public SmoothFlowLayoutPanel()
+    {
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+        DoubleBuffered = true;
+        ResizeRedraw = true;
     }
 }
 
@@ -930,6 +1002,8 @@ internal sealed class Tile : Panel
 
     public Tile(string filePath, int volume, Color color)
     {
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+        DoubleBuffered = true;
         FilePath = filePath;
         Width = 170;
         Height = 170;
@@ -942,6 +1016,7 @@ internal sealed class Tile : Panel
         _name.SetBounds(6, 96, 156, 30);
         _name.TextAlign = ContentAlignment.TopCenter;
         _name.ForeColor = Color.White;
+        _name.BackColor = BackColor;
         _name.Text = Path.GetFileNameWithoutExtension(filePath);
 
         _vol.SetBounds(4, 124, 160, 24);
@@ -954,6 +1029,7 @@ internal sealed class Tile : Panel
         _volLabel.SetBounds(6, 148, 156, 18);
         _volLabel.TextAlign = ContentAlignment.MiddleCenter;
         _volLabel.ForeColor = Color.LightGray;
+        _volLabel.BackColor = BackColor;
         _volLabel.Text = $"{_vol.Value}%";
 
         Controls.AddRange([_play, _name, _vol, _volLabel]);
